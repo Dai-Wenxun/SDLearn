@@ -1,6 +1,6 @@
 # AIGC
 
-This repo contains my generated pictures from [Midjourney](https://www.midjourney.com). The corresponding prompt for each image can be found in the file name.
+This repo contains my generated pictures using [Midjourney](https://www.midjourney.com). The corresponding prompt for each image can be found in the file name.
 
 ![](https://github.com/Dai-Wenxun/AIGC/blob/main/assets/armed%20soldiers%20with%20the%20mechanical%20weapons%2C%20the%20world%20of%20zelda%2C%202d%20pixel%20art%2C%20.png)
 ![](https://github.com/Dai-Wenxun/AIGC/blob/main/assets/black%20hole%20devours%20photons.png)
