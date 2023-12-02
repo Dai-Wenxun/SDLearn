@@ -3,6 +3,7 @@ import gc
 import shutil
 import argparse
 import datetime
+import time
 
 from tqdm.auto import tqdm
 
@@ -112,6 +113,7 @@ def main(
     zero_rank_print(f"Total optimization steps = {max_train_steps}")
 
     global_step = 0
+    start_time = time.time()
     progress_bar = tqdm(range(global_step, max_train_steps))
     progress_bar.set_description("Steps")
 
@@ -153,10 +155,11 @@ def main(
             loss_total += current_loss
             avg_loss = loss_total / len(loss_list)
 
-            logs = {"loss": current_loss, "avg_loss": avg_loss, "epoch": epoch + 1,
+            logs = {"loss": current_loss, "avg_loss": avg_loss,
                     "lr/te": scheduler.get_last_lr()[0], "lr/unet": scheduler.get_last_lr()[1]}
             progress_bar.set_postfix(**logs)
-            writer.add_scalars('logs', logs, global_step=global_step)
+            for tag in logs.keys():
+                writer.add_scalar(tag, logs[tag], global_step=global_step)
 
             if global_step % len(train_dataloader) == 0:
                 save_path = os.path.join(output_dir, f"checkpoints")
@@ -165,6 +168,9 @@ def main(
 
             if global_step >= max_train_steps:
                 break
+
+        duration = (time.time() - start_time) / 3600
+        zero_rank_print(f"Duration: {duration:.2f}")
 
 
 if __name__ == '__main__':
