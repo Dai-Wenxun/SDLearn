@@ -47,7 +47,7 @@ def main(
         device: str = 'cuda'
 ) -> None:
     torch.manual_seed(seed)
-    model_name = os.path.basename(train_data_dir)
+    model_name = os.path.basename(os.path.normpath(train_data_dir))
     folder_name = "debug" if is_debug else model_name + datetime.datetime.now().strftime("-%Y-%m-%dT%H-%M-%S")
     output_dir = os.path.join(output_dir, folder_name)
     if os.path.exists(output_dir):
@@ -170,7 +170,7 @@ def main(
                 break
 
         duration = (time.time() - start_time) / 3600
-        zero_rank_print(f"Duration: {duration:.2f}")
+        zero_rank_print(f"Duration: {duration:.2f}h")
 
 
 if __name__ == '__main__':
