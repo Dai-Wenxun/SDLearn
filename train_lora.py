@@ -155,7 +155,7 @@ def main(
             loss_total += current_loss
             avg_loss = loss_total / len(loss_list)
 
-            logs = {"loss": current_loss, "avg_loss": avg_loss,
+            logs = {"loss": current_loss, "avg_loss": avg_loss, "epoch": epoch + 1,
                     "lr/te": scheduler.get_last_lr()[0], "lr/unet": scheduler.get_last_lr()[1]}
             progress_bar.set_postfix(**logs)
             for tag in logs.keys():
@@ -169,8 +169,8 @@ def main(
             if global_step >= max_train_steps:
                 break
 
-        duration = (time.time() - start_time) / 3600
-        zero_rank_print(f"Duration: {duration:.2f}h")
+    duration = (time.time() - start_time) / 60
+    zero_rank_print(f"Duration: {duration:.2f}m")
 
 
 if __name__ == '__main__':
