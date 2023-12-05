@@ -27,13 +27,13 @@ def main(
         clip_path: str = "cache/models--openai--clip-vit-large-patch14",
         lora_dim: int = 32,
         use_xformers: bool = True,
-        max_train_epochs: int = 20,
+        max_train_epochs: int = 10,
         max_train_steps: int = -1,
         repeat_times: int = 50,
         text_encoder_lr: float = 1e-5,
         unet_lr: float = 1e-4,
         lr_warmup_steps: int = 0,
-        lr_num_cycles: int = 20,
+        lr_num_cycles: int = 10,
         train_batch_size: int = 1,
         max_grad_norm: float = 1.0,
         seed: int = 42,
@@ -114,6 +114,7 @@ def main(
 
     global_step = 0
     start_time = time.time()
+    scaler = torch.cuda.amp.GradScaler()
     progress_bar = tqdm(range(global_step, max_train_steps))
     progress_bar.set_description("Steps")
 
@@ -135,11 +136,13 @@ def main(
 
             with torch.cuda.amp.autocast(dtype=weight_type):
                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                loss = F.mse_loss(noise_pred, noise, reduction='mean')
 
-            loss = F.mse_loss(noise_pred, noise, reduction='mean')
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(lora_net.parameters(), max_grad_norm)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
