@@ -3,15 +3,17 @@ import glob
 from typing import Optional
 from dataclasses import dataclass
 
-import tqdm
+from PIL import Image
+from tqdm.auto import tqdm
+
 import torch
 import torchvision
-from tqdm.auto import tqdm
-from PIL import Image
-from diffusers.utils import BaseOutput
 from torch.utils.data.dataset import Dataset
 
-from lib.utils import zero_rank_print
+from diffusers.utils import BaseOutput
+from accelerate.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -28,7 +30,7 @@ class ImageDataset(Dataset):
         img_paths = []
         for ext in ['jpg', 'png']:
             img_paths.extend(glob.glob(os.path.join(train_data_dir, f'*.{ext}')))
-        zero_rank_print(f'{len(img_paths)} images founded')
+        logger.info(f'{len(img_paths)} images founded')
 
         for img_path in img_paths:
             cap_path = os.path.splitext(img_path)[0] + '.txt'
@@ -43,7 +45,7 @@ class ImageDataset(Dataset):
         ])
 
     def cache_latents(self, vae):
-        zero_rank_print('caching latents')
+        logger.info('caching latents')
         for info in tqdm(self.image_data):
             img = Image.open(info.image_path).convert('RGB')
             img = self.transform(img)

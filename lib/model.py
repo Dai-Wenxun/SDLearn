@@ -1,12 +1,13 @@
 import os
 
 import torch
+
 from safetensors.torch import load_file
+from accelerate.logging import get_logger
 from transformers import CLIPTextModel, CLIPTokenizer, logging
 from diffusers import UNet2DConditionModel, AutoencoderKL
 
-from lib.utils import zero_rank_print
-
+logger = get_logger(__name__)
 
 UNET_PARAMS_MODEL_CHANNELS = 320
 UNET_PARAMS_CHANNEL_MULT = [1, 2, 4, 4]
@@ -474,13 +475,13 @@ def load_target_model(pretrained_model_name_or_path, clip_dir):
     unet = UNet2DConditionModel(**unet_config)
     converted_unet_checkpoint = convert_ldm_unet_checkpoint(state_dict, unet_config)
     info = unet.load_state_dict(converted_unet_checkpoint)
-    zero_rank_print("loading u-net: " + str(info))
+    logger.info("loading u-net: " + str(info))
 
     vae_config = create_vae_diffusers_config()
     vae = AutoencoderKL(**vae_config)
     converted_vae_checkpoint = convert_ldm_vae_checkpoint(state_dict, vae_config)
     info = vae.load_state_dict(converted_vae_checkpoint)
-    zero_rank_print("loading vae: " + str(info))
+    logger.info("loading vae: " + str(info))
 
     converted_text_encoder_checkpoint = convert_ldm_clip_checkpoint(state_dict)
     logging.set_verbosity_error()
@@ -488,6 +489,6 @@ def load_target_model(pretrained_model_name_or_path, clip_dir):
     tokenizer = CLIPTokenizer.from_pretrained(clip_dir)
     logging.set_verbosity_warning()
     info = text_model.load_state_dict(converted_text_encoder_checkpoint)
-    zero_rank_print("loading text encoder: " + str(info))
+    logger.info("loading text encoder: " + str(info))
 
     return text_model, tokenizer, vae, unet

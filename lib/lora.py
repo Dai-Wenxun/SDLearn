@@ -2,7 +2,9 @@ import math
 import os
 import torch
 
-from lib.utils import zero_rank_print
+from accelerate.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class LoRAModule(torch.nn.Module):
@@ -65,9 +67,9 @@ class LoRANetwork(torch.nn.Module):
             return loras
 
         self.text_encoder_loras = create_modules(False, text_encoder, LoRANetwork.TEXT_ENCODER_TARGET_REPLACE_MODULE)
-        zero_rank_print(f"create LoRA for Text Encoder: {len(self.text_encoder_loras)} modules")
+        logger.info(f"create LoRA for Text Encoder: {len(self.text_encoder_loras)} modules")
         self.unet_loras = create_modules(True, unet, LoRANetwork.UNET_TARGET_REPLACE_MODULE)
-        zero_rank_print(f"create LoRA for U-Net: {len(self.unet_loras)} modules")
+        logger.info(f"create LoRA for U-Net: {len(self.unet_loras)} modules")
 
         for lora in self.text_encoder_loras + self.unet_loras:
             self.add_module(lora.lora_name, lora)
