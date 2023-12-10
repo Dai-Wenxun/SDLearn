@@ -1,9 +1,11 @@
 import os
 import gc
+import math
+import time
 import shutil
+import logging
 import argparse
 import datetime
-import time
 
 from tqdm.auto import tqdm
 
@@ -11,6 +13,12 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import ProjectConfiguration, set_seed
+
+import diffusers
+import transformers
 from diffusers import DDPMScheduler
 from diffusers.optimization import get_cosine_with_hard_restarts_schedule_with_warmup
 
@@ -20,18 +28,24 @@ from lib.dataset import ImageDataset, RepeatDataset
 from lib.utils import zero_rank_print
 
 
+logger = get_logger(__name__)
+
+
 def main(
         train_data_dir: str,
         output_dir: str = "outputs",
+        logging_dir: str = 'logs',
+        report_to: str = 'tensorboard',
         pretrained_path: str = "cache/majicmixRealistic_v6.safetensors",
         clip_path: str = "cache/models--openai--clip-vit-large-patch14",
         lora_dim: int = 32,
-        use_xformers: bool = True,
-        max_train_epochs: int = 10,
+        enable_xformers_memory_efficient_attention: bool = True,
+        num_train_epochs: int = 10,
         max_train_steps: int = -1,
         repeat_times: int = 50,
         text_encoder_lr: float = 1e-5,
         unet_lr: float = 1e-4,
+        gradient_accumulation_steps: int = 1,
         lr_warmup_steps: int = 0,
         lr_num_cycles: int = 10,
         train_batch_size: int = 1,
@@ -42,40 +56,60 @@ def main(
         beta_schedule: str = "scaled_linear",
         num_train_timesteps: int = 1000,
         clip_sample: bool = False,
-        is_debug: bool = False,
-        weight_type: torch.dtype = torch.float16,
-        device: str = 'cuda'
+        is_debug: bool = True,
+        mixed_precision: str = 'fp16'
 ) -> None:
-    torch.manual_seed(seed)
     model_name = os.path.basename(os.path.normpath(train_data_dir))
     folder_name = "debug" if is_debug else model_name + datetime.datetime.now().strftime("-%Y-%m-%dT%H-%M-%S")
     output_dir = os.path.join(output_dir, folder_name)
-    if os.path.exists(output_dir):
-        shutil.rmtree(output_dir)
+    logging_dir = os.path.join(output_dir, logging_dir)
+    accelerator_project_config = ProjectConfiguration(project_dir=output_dir, logging_dir=logging_dir)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        mixed_precision=mixed_precision,
+        log_with=report_to,
+        project_config=accelerator_project_config
+    )
+    if accelerator.is_main_process:
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(f"{output_dir}/checkpoints", exist_ok=True)
 
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(f"{output_dir}/checkpoints", exist_ok=True)
-    writer = SummaryWriter(output_dir)
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logger.info(accelerator.state, main_process_only=False)
+    if accelerator.is_main_process:
+        transformers.utils.logging.set_verbosity_warning()
+        diffusers.utils.logging.set_verbosity_info()
+    else:
+        transformers.utils.logging.set_verbosity_error()
+        diffusers.utils.logging.set_verbosity_error()
 
-    dataset = ImageDataset(train_data_dir)
+    set_seed(seed)
+
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
     text_encoder, tokenizer, vae, unet = load_target_model(pretrained_path, clip_path)
     lora_net = LoRANetwork(text_encoder, unet, lora_dim=lora_dim)
+    if enable_xformers_memory_efficient_attention:
+        unet.enable_xformers_memory_efficient_attention()
 
-    unet.requires_grad_(False).to(device, dtype=weight_type).eval()
-    text_encoder.requires_grad_(False).to(device).eval()
-    vae.requires_grad_(False).to(device, dtype=weight_type).eval()
-    lora_net.to(device)
-
-    if use_xformers:
-        for module in unet.modules():
-            if module.__class__.__name__ == 'BasicTransformerBlock':
-                module.set_use_memory_efficient_attention_xformers(True)
-
+    vae.requires_grad_(False).to(accelerator.device, dtype=weight_dtype).eval()
+    dataset = ImageDataset(train_data_dir)
     dataset.cache_latents(vae)
     vae.cpu()
     torch.cuda.empty_cache()
     gc.collect()
     del vae
+    accelerator.wait_for_everyone()
 
     noise_scheduler = DDPMScheduler(
         beta_start=beta_start,
@@ -96,84 +130,114 @@ def main(
         persistent_workers=False
     )
 
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / gradient_accumulation_steps)
     if max_train_steps == -1:
-        assert max_train_epochs != -1
-        max_train_steps = max_train_epochs * len(train_dataloader)
+        max_train_steps = num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
 
     trainable_params = lora_net.prepare_optimizer_params(text_encoder_lr, unet_lr)
     optimizer = torch.optim.AdamW(trainable_params)
-    scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
-        optimizer, num_warmup_steps=lr_warmup_steps,
-        num_training_steps=max_train_steps, num_cycles=lr_num_cycles)
+    lr_scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
+        optimizer, num_warmup_steps=lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=max_train_steps * accelerator.num_processes,
+        num_cycles=lr_num_cycles
+    )
 
-    zero_rank_print("Running Training")
-    zero_rank_print(f"Num examples = {len(dataset)}")
-    zero_rank_print(f"Num Epochs = {max_train_epochs}")
-    zero_rank_print(f"Instantaneous batch size per device = {train_batch_size}")
-    zero_rank_print(f"Total optimization steps = {max_train_steps}")
+    lora_net, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        lora_net, optimizer, train_dataloader, lr_scheduler
+    )
 
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / gradient_accumulation_steps)
+    if overrode_max_train_steps:
+        max_train_steps = num_train_epochs * num_update_steps_per_epoch
+    num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
+
+    unet.requires_grad_(False).to(accelerator.device, dtype=weight_dtype).eval()
+    text_encoder.requires_grad_(False).to(accelerator.device).eval()
+
+    if accelerator.is_main_process:
+        accelerator.init_trackers("text2image-fine-tune", config=vars(args))
+
+    total_batch_size = train_batch_size * accelerator.num_processes * gradient_accumulation_steps
+
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num Epochs = {num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {max_train_steps}")
     global_step = 0
+
     start_time = time.time()
-    scaler = torch.cuda.amp.GradScaler()
-    progress_bar = tqdm(range(global_step, max_train_steps))
-    progress_bar.set_description("Steps")
+    progress_bar = tqdm(
+        range(global_step, max_train_steps),
+        desc="Steps",
+        disable=not accelerator.is_main_process
+    )
 
     loss_list = []
     loss_total = 0.0
-    for epoch in range(0, max_train_epochs):
+    for epoch in range(0, num_train_epochs):
         lora_net.train()
+        train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            latents = batch['latents'].to(device) * 0.18215
-            caption = batch['caption']
-            b_size = latents.shape[0]
-            input_ids = tokenizer(caption, padding='max_length', truncation=True, return_tensors='pt').input_ids
-            input_ids = input_ids.to(device)
-            encoder_hidden_states = text_encoder(input_ids)[0]
+            with accelerator.accumulate(lora_net):
+                latents = batch['latents'].to(accelerator.device) * 0.18215
+                caption = batch['caption']
+                b_size = latents.shape[0]
+                input_ids = tokenizer(caption, padding='max_length', truncation=True, return_tensors='pt').input_ids
+                input_ids = input_ids.to(accelerator.device)
+                encoder_hidden_states = text_encoder(input_ids)[0]
 
-            noise = torch.randn_like(latents)
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (b_size,), device=latents.device)
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                noise = torch.randn_like(latents)
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (b_size,), device=latents.device)
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            with torch.cuda.amp.autocast(dtype=weight_type):
-                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                loss = F.mse_loss(noise_pred, noise, reduction='mean')
+                with accelerator.autocast():
+                    noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    loss = F.mse_loss(noise_pred, noise, reduction='mean')
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(lora_net.parameters(), max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+                avg_loss = accelerator.gather(loss.repeat(train_batch_size)).mean()
+                train_loss += avg_loss.item() / gradient_accumulation_steps
 
-            progress_bar.update(1)
-            global_step += 1
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(lora_net.parameters(), max_grad_norm)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            current_loss = loss.detach().item()
-            if epoch == 0:
-                loss_list.append(current_loss)
-            else:
-                loss_total -= loss_list[step]
-                loss_list[step] = current_loss
-            loss_total += current_loss
-            avg_loss = loss_total / len(loss_list)
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
 
-            logs = {"loss": current_loss, "avg_loss": avg_loss, "epoch": epoch + 1,
-                    "lr/te": scheduler.get_last_lr()[0], "lr/unet": scheduler.get_last_lr()[1]}
-            progress_bar.set_postfix(**logs)
-            for tag in logs.keys():
-                writer.add_scalar(tag, logs[tag], global_step=global_step)
+                if epoch == 0:
+                    loss_list.append(train_loss)
+                else:
+                    loss_total -= loss_list[step]
+                    loss_list[step] = train_loss
+                loss_total += train_loss
+                avg_loss = loss_total / len(loss_list)
 
-            if global_step % len(train_dataloader) == 0:
-                save_path = os.path.join(output_dir, f"checkpoints")
-                lora_net.save_weights(os.path.join(save_path, "{}-{:06d}".format(model_name, epoch + 1) + ".safetensors"), weight_type)
-                zero_rank_print(f"Saved state to {save_path} (epoch: {epoch + 1})")
+                logs = {"loss": train_loss, "avg_loss": avg_loss, "epoch": epoch + 1,
+                        "lr/te": lr_scheduler.get_last_lr()[0], "lr/unet": lr_scheduler.get_last_lr()[1]}
+                progress_bar.set_postfix(**logs)
+                accelerator.log(logs, step=global_step)
 
-            if global_step >= max_train_steps:
-                break
+                if global_step % len(train_dataloader) == 0:
+                    save_path = os.path.join(output_dir, f"checkpoints")
+                    lora_net.save_weights(os.path.join(save_path, "{}-{:06d}".format(model_name, epoch + 1) + ".safetensors"), weight_dtype)
+                    zero_rank_print(f"Saved state to {save_path} (epoch: {epoch + 1})")
+
+                if global_step >= max_train_steps:
+                    break
 
     duration = (time.time() - start_time) / 60
-    zero_rank_print(f"Duration: {duration:.2f}m")
+    accelerator.print(f"Duration: {duration:.2f}m")
+
+    accelerator.end_training()
 
 
 if __name__ == '__main__':
