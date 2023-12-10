@@ -157,7 +157,7 @@ def main(
     text_encoder.requires_grad_(False).to(accelerator.device).eval()
 
     if accelerator.is_main_process:
-        accelerator.init_trackers("text2image-fine-tune", config=vars(args))
+        accelerator.init_trackers("lora training")
 
     total_batch_size = train_batch_size * accelerator.num_processes * gradient_accumulation_steps
 
@@ -225,14 +225,20 @@ def main(
                         "lr/te": lr_scheduler.get_last_lr()[0], "lr/unet": lr_scheduler.get_last_lr()[1]}
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
+                train_loss = 0.0
 
-                if global_step % len(train_dataloader) == 0:
+                if global_step % len(train_dataloader) == 0 and accelerator.is_main_process:
                     save_path = os.path.join(output_dir, f"checkpoints")
                     lora_net.save_weights(os.path.join(save_path, "{}-{:06d}".format(model_name, epoch + 1) + ".safetensors"), weight_dtype)
                     zero_rank_print(f"Saved state to {save_path} (epoch: {epoch + 1})")
 
-                if global_step >= max_train_steps:
-                    break
+            else:
+                logs = {"loss": train_loss, "epoch": epoch + 1,
+                        "lr/te": lr_scheduler.get_last_lr()[0], "lr/unet": lr_scheduler.get_last_lr()[1]}
+                progress_bar.set_postfix(**logs)
+
+            if global_step >= max_train_steps:
+                break
 
     duration = (time.time() - start_time) / 60
     accelerator.print(f"Duration: {duration:.2f}m")
