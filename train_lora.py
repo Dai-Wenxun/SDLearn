@@ -145,16 +145,13 @@ def main(
         batch_size=train_batch_size,
         shuffle=True,
         num_workers=0,
-        drop_last=True,
         pin_memory=True,
         persistent_workers=False
     )
 
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / accelerator.num_processes / gradient_accumulation_steps)
     if max_train_steps == -1:
         max_train_steps = num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
 
     lr_scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
         optimizer, num_warmup_steps=lr_warmup_steps * accelerator.num_processes,
@@ -165,11 +162,6 @@ def main(
     lora_net, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         lora_net, optimizer, train_dataloader, lr_scheduler
     )
-
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        max_train_steps = num_train_epochs * num_update_steps_per_epoch
-    num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
 
     if accelerator.is_main_process:
         accelerator.init_trackers("lora training")
