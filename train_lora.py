@@ -114,7 +114,6 @@ def main(
     unet.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device)
-    lora_net.to(accelerator.device)
 
     if enable_xformers_memory_efficient_attention:
         unet.enable_xformers_memory_efficient_attention()
@@ -192,7 +191,7 @@ def main(
         train_loss_list = []
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(lora_net):
-                latents = batch['latents'].to(accelerator.device) * 0.18215
+                latents = batch['latents'] * 0.18215
                 caption = batch['caption']
                 b_size = latents.shape[0]
                 input_ids = tokenizer(caption, padding='max_length', truncation=True, return_tensors='pt').input_ids
