@@ -43,6 +43,7 @@ def main(
         repeat_times: int = 50,
         text_encoder_lr: float = 1e-5,
         unet_lr: float = 1e-4,
+        scale_lr: bool = True,
         gradient_accumulation_steps: int = 1,
         lr_warmup_steps: int = 0,
         lr_num_cycles: int = 10,
@@ -117,6 +118,13 @@ def main(
 
     if enable_xformers_memory_efficient_attention:
         unet.enable_xformers_memory_efficient_attention()
+
+    if scale_lr:
+        scale_factor = gradient_accumulation_steps * train_batch_size * accelerator.num_processes
+        text_encoder_lr *= scale_factor
+        unet_lr *= scale_factor
+        logger.info(f"Scale learning rate with factor {scale_factor}: "
+                    f"text_encoder:{text_encoder_lr}, unet_lr:{unet_lr}")
 
     trainable_params = lora_net.prepare_optimizer_params(text_encoder_lr, unet_lr)
     optimizer = torch.optim.AdamW(trainable_params)
@@ -231,7 +239,8 @@ def main(
 
                 if accelerator.is_main_process and global_step % len(train_dataloader) == 0:
                     save_path = os.path.join(output_dir, f"checkpoints")
-                    lora_net.save_weights(os.path.join(save_path, "{}-{:06d}".format(model_name, epoch + 1) + ".safetensors"), weight_dtype)
+                    ckpt_path = os.path.join(save_path, "{}-{:06d}".format(model_name, epoch + 1) + ".safetensors")
+                    accelerator.unwrap_model(lora_net).save_weights(ckpt_path, weight_dtype)
                     logger.info(f"Saved state to {save_path} (epoch: {epoch + 1})")
 
             else:
