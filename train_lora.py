@@ -230,7 +230,7 @@ def main(
                 if global_step % len(train_dataloader) == 0 and accelerator.is_main_process:
                     save_path = os.path.join(output_dir, f"checkpoints")
                     lora_net.save_weights(os.path.join(save_path, "{}-{:06d}".format(model_name, epoch + 1) + ".safetensors"), weight_dtype)
-                    zero_rank_print(f"Saved state to {save_path} (epoch: {epoch + 1})")
+                    logger.info(f"Saved state to {save_path} (epoch: {epoch + 1})")
 
             else:
                 logs = {"loss": train_loss, "epoch": epoch + 1,
@@ -241,8 +241,7 @@ def main(
                 break
 
     duration = (time.time() - start_time) / 60
-    accelerator.print(f"Duration: {duration:.2f}m")
-
+    logger.info(f"Duration: {duration:.2f}m")
     accelerator.end_training()
 
 
