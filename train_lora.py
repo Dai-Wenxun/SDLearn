@@ -55,7 +55,7 @@ def main(
         beta_schedule: str = "scaled_linear",
         num_train_timesteps: int = 1000,
         clip_sample: bool = False,
-        is_debug: bool = True,
+        is_debug: bool = False,
         mixed_precision: str = 'fp16'
 ) -> None:
 
