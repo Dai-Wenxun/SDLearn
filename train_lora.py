@@ -25,8 +25,6 @@ from diffusers.optimization import get_cosine_with_hard_restarts_schedule_with_w
 from lib.model import load_target_model
 from lib.lora import LoRANetwork
 from lib.dataset import ImageDataset, RepeatDataset
-from lib.utils import zero_rank_print
-
 
 logger = get_logger(__name__)
 
@@ -59,11 +57,13 @@ def main(
         is_debug: bool = True,
         mixed_precision: str = 'fp16'
 ) -> None:
+
     model_name = os.path.basename(os.path.normpath(train_data_dir))
     folder_name = "debug" if is_debug else model_name + datetime.datetime.now().strftime("-%Y-%m-%dT%H-%M-%S")
     output_dir = os.path.join(output_dir, folder_name)
     logging_dir = os.path.join(output_dir, logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=output_dir, logging_dir=logging_dir)
+
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         mixed_precision=mixed_precision,
@@ -82,34 +82,15 @@ def main(
         level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
-    if accelerator.is_main_process:
+    if accelerator.is_local_main_process:
         transformers.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
     else:
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
-    set_seed(seed)
-
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-
-    text_encoder, tokenizer, vae, unet = load_target_model(pretrained_path, clip_path)
-    lora_net = LoRANetwork(text_encoder, unet, lora_dim=lora_dim)
-    if enable_xformers_memory_efficient_attention:
-        unet.enable_xformers_memory_efficient_attention()
-
-    vae.requires_grad_(False).to(accelerator.device, dtype=weight_dtype).eval()
-    dataset = ImageDataset(train_data_dir)
-    dataset.cache_latents(vae)
-    vae.cpu()
-    torch.cuda.empty_cache()
-    gc.collect()
-    del vae
-    accelerator.wait_for_everyone()
+    if seed is not None:
+        set_seed(seed)
 
     noise_scheduler = DDPMScheduler(
         beta_start=beta_start,
@@ -118,6 +99,38 @@ def main(
         num_train_timesteps=num_train_timesteps,
         clip_sample=clip_sample
     )
+    text_encoder, tokenizer, vae, unet = load_target_model(pretrained_path, clip_path)
+    lora_net = LoRANetwork(text_encoder, unet, lora_dim=lora_dim)
+    unet.requires_grad_(False)
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    unet.to(accelerator.device, dtype=weight_dtype)
+    vae.to(accelerator.device, dtype=weight_dtype)
+    text_encoder.to(accelerator.device)
+    lora_net.to(accelerator.device)
+
+    if enable_xformers_memory_efficient_attention:
+        unet.enable_xformers_memory_efficient_attention()
+
+    trainable_params = lora_net.prepare_optimizer_params(text_encoder_lr, unet_lr)
+    optimizer = torch.optim.AdamW(trainable_params)
+
+    # cache latents
+    dataset = ImageDataset(train_data_dir)
+    vae.eval()
+    dataset.cache_latents(vae)
+    vae.cpu()
+    torch.cuda.empty_cache()
+    gc.collect()
+    del vae
+    accelerator.wait_for_everyone()
 
     train_dataset = RepeatDataset(dataset, times=repeat_times)
     train_dataloader = torch.utils.data.DataLoader(
@@ -136,8 +149,6 @@ def main(
         max_train_steps = num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    trainable_params = lora_net.prepare_optimizer_params(text_encoder_lr, unet_lr)
-    optimizer = torch.optim.AdamW(trainable_params)
     lr_scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(
         optimizer, num_warmup_steps=lr_warmup_steps * accelerator.num_processes,
         num_training_steps=max_train_steps * accelerator.num_processes,
@@ -152,9 +163,6 @@ def main(
     if overrode_max_train_steps:
         max_train_steps = num_train_epochs * num_update_steps_per_epoch
     num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
-
-    unet.requires_grad_(False).to(accelerator.device, dtype=weight_dtype).eval()
-    text_encoder.requires_grad_(False).to(accelerator.device).eval()
 
     if accelerator.is_main_process:
         accelerator.init_trackers("lora training")
@@ -177,11 +185,11 @@ def main(
         disable=not accelerator.is_main_process
     )
 
-    loss_list = []
-    loss_total = 0.0
     for epoch in range(0, num_train_epochs):
         lora_net.train()
         train_loss = 0.0
+        train_loss_total = 0.0
+        train_loss_list = []
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(lora_net):
                 latents = batch['latents'].to(accelerator.device) * 0.18215
@@ -212,14 +220,9 @@ def main(
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-
-                if epoch == 0:
-                    loss_list.append(train_loss)
-                else:
-                    loss_total -= loss_list[step]
-                    loss_list[step] = train_loss
-                loss_total += train_loss
-                avg_loss = loss_total / len(loss_list)
+                train_loss_total += train_loss
+                train_loss_list.append(train_loss)
+                avg_loss = train_loss_total / len(train_loss_list)
 
                 logs = {"loss": train_loss, "avg_loss": avg_loss, "epoch": epoch + 1,
                         "lr/te": lr_scheduler.get_last_lr()[0], "lr/unet": lr_scheduler.get_last_lr()[1]}
@@ -227,7 +230,7 @@ def main(
                 accelerator.log(logs, step=global_step)
                 train_loss = 0.0
 
-                if global_step % len(train_dataloader) == 0 and accelerator.is_main_process:
+                if accelerator.is_main_process and global_step % len(train_dataloader) == 0:
                     save_path = os.path.join(output_dir, f"checkpoints")
                     lora_net.save_weights(os.path.join(save_path, "{}-{:06d}".format(model_name, epoch + 1) + ".safetensors"), weight_dtype)
                     logger.info(f"Saved state to {save_path} (epoch: {epoch + 1})")
@@ -240,6 +243,7 @@ def main(
             if global_step >= max_train_steps:
                 break
 
+    accelerator.wait_for_everyone()
     duration = (time.time() - start_time) / 60
     logger.info(f"Duration: {duration:.2f}m")
     accelerator.end_training()

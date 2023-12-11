@@ -44,6 +44,7 @@ class ImageDataset(Dataset):
             torchvision.transforms.Normalize(0.5, 0.5)
         ])
 
+    @torch.no_grad()
     def cache_latents(self, vae):
         logger.info('caching latents')
         for info in tqdm(self.image_data):
