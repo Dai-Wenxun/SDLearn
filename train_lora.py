@@ -183,12 +183,11 @@ def main(
         desc="Steps",
         disable=not accelerator.is_main_process
     )
-
+    loss_list = []
+    loss_total = 0.0
     for epoch in range(0, num_train_epochs):
         lora_net.train()
         train_loss = 0.0
-        train_loss_total = 0.0
-        train_loss_list = []
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(lora_net):
                 latents = batch['latents'] * 0.18215
@@ -206,8 +205,8 @@ def main(
                     noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
                     loss = F.mse_loss(noise_pred, noise, reduction='mean')
 
-                avg_loss = accelerator.gather(loss.repeat(train_batch_size)).mean()
-                train_loss += avg_loss.item() / gradient_accumulation_steps
+                avg_train_loss = accelerator.gather(loss.repeat(train_batch_size)).mean()
+                train_loss += avg_train_loss.item() / gradient_accumulation_steps
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -219,10 +218,14 @@ def main(
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                train_loss_total += train_loss
-                train_loss_list.append(train_loss)
-                avg_loss = train_loss_total / len(train_loss_list)
 
+                if epoch == 0:
+                    loss_list.append(train_loss)
+                else:
+                    loss_total -= loss_list[step]
+                    loss_list[step] = train_loss
+                loss_total += train_loss
+                avg_loss = loss_total / len(loss_list)
                 logs = {"loss": train_loss, "avg_loss": avg_loss, "epoch": epoch + 1,
                         "lr/te": lr_scheduler.get_last_lr()[0], "lr/unet": lr_scheduler.get_last_lr()[1]}
                 progress_bar.set_postfix(**logs)
